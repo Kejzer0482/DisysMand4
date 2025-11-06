@@ -21,7 +21,7 @@ type CommServer struct {
 	proto.UnimplementedRequestServiceServer
 	username 		string
 	clients 		map[string]proto.RequestService_CommServer
-	servers         map[string]proto.RequestServiceClient
+	servers         map[string]grpc.BidiStreamingClient[proto.RequestMessage, proto.RequestMessage]
 	fileName 		string
 	mutex			sync.Mutex
 	state 			string
@@ -33,7 +33,8 @@ type CommServer struct {
 func NewCommServer() *CommServer {
 	return &CommServer{
 		username: 	"Node A",
-		clients: 		make(map[string]proto.RequestService_CommServer),
+		clients: 	make(map[string]proto.RequestService_CommServer),
+		servers:	make(map[string]grpc.BidiStreamingClient[proto.RequestMessage, proto.RequestMessage]),
 		fileName:	"../Database.txt",
 		mutex:		sync.Mutex{},
 		state: 		"RELEASED",
@@ -186,6 +187,8 @@ func main() {
 			log.Fatalf("Failed to create stream: %v", err)
 		}
 		fmt.Printf("Connected to node at %s\n", address)
+
+		newComm.servers[address] = stream
 	}
 
 	go func() {
