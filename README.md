@@ -1,12 +1,7 @@
 # How to use the system
 
-## Server
-### To run the server
-```go run ./server```
-
-### To close the server (gracefully)
-```exit```
-
-## Clients
-### To join the server (new terminal)
-```go run ./client```
+## Nodes
+### To run the nodes
+```node/node.go -port=5069```
+```node/node.go -port=5068```
+```node/node.go -port=5067```
