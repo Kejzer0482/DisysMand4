@@ -3,11 +3,12 @@ package main
 import (
 	proto "RequestCP/grpc"
 	"bufio"
-	"os"
+	"context"
 	"fmt"
 	"log"
 	"net"
-	"context"
+	"os"
+
 	//"io/ioutil"
 	"strings"
 	"sync"
@@ -19,29 +20,29 @@ import (
 
 type CommServer struct {
 	proto.UnimplementedRequestServiceServer
-	username 		string
-	clients 		map[string]proto.RequestService_CommServer
-	servers         map[string]grpc.BidiStreamingClient[proto.RequestMessage, proto.RequestMessage]
-	fileName 		string
-	mutex			sync.Mutex
-	state 			string
-	deferred		[]string
-	waitingRep		[]string
-	LCt     		int64
+	username   string
+	clients    map[string]proto.RequestService_CommServer
+	servers    map[string]grpc.BidiStreamingClient[proto.RequestMessage, proto.RequestMessage]
+	fileName   string
+	mutex      sync.Mutex
+	state      string
+	deferred   []string
+	waitingRep []string
+	LCt        int64
 }
 
 // NewCommServer initializes a new CommServer
 func NewCommServer() *CommServer {
 	return &CommServer{
-		username: 	"localhost:5069",
-		clients: 	make(map[string]proto.RequestService_CommServer),
-		servers:	make(map[string]grpc.BidiStreamingClient[proto.RequestMessage, proto.RequestMessage]),
-		fileName:	"../Database.txt",
-		mutex:		sync.Mutex{},
-		state: 		"RELEASED",
-		deferred:	[]string{},
-		waitingRep:	[]string{},
-		LCt:     	0,
+		username:   "localhost:5069",
+		clients:    make(map[string]proto.RequestService_CommServer),
+		servers:    make(map[string]grpc.BidiStreamingClient[proto.RequestMessage, proto.RequestMessage]),
+		fileName:   "../Database.txt",
+		mutex:      sync.Mutex{},
+		state:      "RELEASED",
+		deferred:   []string{},
+		waitingRep: []string{},
+		LCt:        0,
 	}
 }
 
@@ -71,11 +72,27 @@ func (s *CommServer) Comm(stream proto.RequestService_CommServer) error {
 			return err
 		}
 
+		// First message should contain the username
+		if username == "" {
+			username = msg.Username
+			s.addClient(username, stream)
+			fmt.Printf("User %s connected.\n", username)
+		}
+
 		// Update Logical Clock
 		s.mutex.Lock()
 		s.LCt = max(s.LCt, msg.Timestamp) + 1
 		msg.Timestamp = s.LCt
 		s.mutex.Unlock()
+
+		switch msg.Message {
+		case "REQUEST":
+			go s.handleRequest(msg)
+		case "REPLY":
+			go s.handleReply(msg)
+		case "PING":
+			// Ignore PING messages
+		}
 	}
 }
 
@@ -83,6 +100,7 @@ func (s *CommServer) Comm(stream proto.RequestService_CommServer) error {
 func (s *CommServer) addClient(username string, stream proto.RequestService_CommServer) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+
 	s.clients[username] = stream
 }
 
@@ -90,6 +108,7 @@ func (s *CommServer) addClient(username string, stream proto.RequestService_Comm
 func (s *CommServer) removeClient(username string) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+
 	delete(s.clients, username)
 	delete(s.servers, username)
 }
@@ -97,45 +116,122 @@ func (s *CommServer) removeClient(username string) {
 func (s *CommServer) handleRequest(msg *proto.RequestMessage) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+
+	if (msg.Timestamp > s.LCt && s.state == "WANTED") || (s.state == "HELD") {
+		s.deferred = append(s.deferred, msg.Username)
+	} else {
+		s.sendReply(msg)
+	}
+	s.LCt = max(s.LCt, msg.Timestamp) + 1
+
 }
 
 func (s *CommServer) handleReply(msg *proto.RequestMessage) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+
+	// Remove the sender from waitingRep
+	for i, username := range s.waitingRep {
+		if username == msg.Username {
+			s.waitingRep = append(s.waitingRep[:i], s.waitingRep[i+1:]...)
+			break
+		}
+	}
+	s.LCt = max(s.LCt, msg.Timestamp) + 1
+
 }
 
-func (s *CommServer) sendRequest(msg *proto.RequestMessage) {
+func (s *CommServer) sendRequests() {
 	s.mutex.Lock()
 	s.state = "WANTED"
-	s.LCt++
+	s.LCt = s.LCt + 1
 	timestamp := s.LCt
+	s.checkConnections()
 	s.mutex.Unlock()
 
 	reqMsg := &proto.RequestMessage{
-			Username:  s.username,
-			Message:   "REQUEST",
-			Timestamp: timestamp,
+		Username:  s.username,
+		Message:   "REQUEST",
+		Timestamp: timestamp,
 	}
-	
+
 	for node := range s.servers {
 		stream, err := s.servers[node]
-		if err{
+		if err {
 			log.Printf("Error getting stream for node %s: %v", node, err)
 			continue
 		}
 		stream.Send(reqMsg)
+		s.waitingRep = append(s.waitingRep, node)
 	}
 
+	s.waitReplies()
 }
 
 func (s *CommServer) sendReply(msg *proto.RequestMessage) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+
+	//Update Logical Clock
+	s.LCt = max(s.LCt, msg.Timestamp) + 1
+
+	// Send REPLY message
+	replyMsg := &proto.RequestMessage{
+		Username:  s.username,
+		Message:   "REPLY",
+		Timestamp: s.LCt,
+	}
+	s.servers[msg.Username].Send(replyMsg)
+
+}
+
+func (s *CommServer) waitReplies() {
+	for {
+		if len(s.waitingRep) == 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond) // Sleep to avoid busy waiting
+	}
+	s.enterCriticalSection()
 }
 
 func (s *CommServer) enterCriticalSection() {
+	// Implementation for entering critical section
 	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	s.state = "HELD"
+	s.LCt = s.LCt + 1
+	s.mutex.Unlock()
+
+	fmt.Printf("L: %d - [Server] (Critical Section) Entered critical section.\n", s.LCt)
+
+	// Simulate critical section by reading the database file
+	content, err := os.ReadFile(s.fileName)
+	if err != nil {
+		log.Fatalf("Failed to read database file: %v", err)
+	}
+	fmt.Println(string(content))
+
+	time.Sleep(5 * time.Second) // Simulate time spent in critical section
+
+	s.exitCriticalSection()
+}
+
+func (s *CommServer) exitCriticalSection() {
+	s.mutex.Lock()
+	s.state = "RELEASED"
+	s.LCt = s.LCt + 1
+	s.mutex.Unlock()
+
+	fmt.Printf("L: %d - [Server] (Critical Section) Exited critical section.\n", s.LCt)
+	// Send REPLY messages to deferred requests
+	for _, username := range s.deferred {
+		s.sendReply(&proto.RequestMessage{
+			Username:  username,
+			Message:   "REPLY",
+			Timestamp: s.LCt,
+		})
+	}
+	s.deferred = []string{}
 }
 
 func (s *CommServer) checkConnections() {
@@ -163,8 +259,19 @@ func (s *CommServer) checkConnections() {
 		if address == s.username {
 			continue // Skip connecting to itself
 		}
-		if _, exists := s.servers[address]; exists {
-			continue // Skip if address is in servers map
+
+		stream, exists := s.servers[address]
+		if exists {
+			// Try sending a ping to test if the connection is alive
+			err := stream.Send(&proto.RequestMessage{
+				Username:  s.username,
+				Message:   "PING",
+				Timestamp: s.LCt})
+			if err == nil {
+				continue // Connection is healthy
+			}
+			log.Printf("Connection to %s is dead, removing and reconnecting", address)
+			delete(s.servers, address)
 		}
 
 		conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -179,24 +286,6 @@ func (s *CommServer) checkConnections() {
 			fmt.Printf("Connected to node at %s\n", address)
 
 			s.servers[address] = stream
-
-			// Start a goroutine to listen for messages from this node
-			go func(address string, stream grpc.BidiStreamingClient[proto.RequestMessage, proto.RequestMessage]) {
-				for {
-					msg, err := stream.Recv()
-					if err != nil {
-						log.Printf("Error receiving message from %s: %v", address, err)
-						return
-					}
-					switch msg.Message {
-					case "REQUEST":
-						s.handleRequest(msg)
-					case "REPLY":
-						s.handleReply(msg)
-					}
-				}
-			}(address, stream)
-			defer conn.Close()
 		}
 	}
 }
@@ -215,27 +304,15 @@ func main() {
 
 	fmt.Printf("L: %d - [Server] (Announcement) Comm server started on port 5069...\n", newComm.LCt)
 
-	
-
-	// Listen to other nodes
-
 	go func() {
 		for {
-
-			content, err := os.ReadFile(newComm.fileName)
-			if err != nil {
-				log.Fatalf("Failed to read database file: %v", err)
-			}
-			fmt.Println(string(content))
-			time.Sleep(2 * time.Second)
+			newComm.sendRequests()
+			time.Sleep(10 * time.Second) // Wait before next request
 		}
-		
 	}()
 
 	if err := server.Serve(lis); err != nil {
 		log.Fatalf("Failed to serve: %v", err)
 	}
-
-	
 
 }
