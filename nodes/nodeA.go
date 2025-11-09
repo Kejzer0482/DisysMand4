@@ -26,19 +26,21 @@ type CommServer struct {
 	mutex			sync.Mutex
 	state 			string
 	deferred		[]string
+	waitingRep		[]string
 	LCt     		int64
 }
 
 // NewCommServer initializes a new CommServer
 func NewCommServer() *CommServer {
 	return &CommServer{
-		username: 	"Node A",
+		username: 	"localhost:5069",
 		clients: 	make(map[string]proto.RequestService_CommServer),
 		servers:	make(map[string]grpc.BidiStreamingClient[proto.RequestMessage, proto.RequestMessage]),
 		fileName:	"../Database.txt",
 		mutex:		sync.Mutex{},
 		state: 		"RELEASED",
 		deferred:	[]string{},
+		waitingRep:	[]string{},
 		LCt:     	0,
 	}
 }
@@ -89,6 +91,7 @@ func (s *CommServer) removeClient(username string) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	delete(s.clients, username)
+	delete(s.servers, username)
 }
 
 func (s *CommServer) handleRequest(msg *proto.RequestMessage) {
@@ -114,8 +117,8 @@ func (s *CommServer) sendRequest(msg *proto.RequestMessage) {
 			Timestamp: timestamp,
 	}
 	
-	for node := range s.clients {
-		stream, err := s.clients[node]
+	for node := range s.servers {
+		stream, err := s.servers[node]
 		if err{
 			log.Printf("Error getting stream for node %s: %v", node, err)
 			continue
@@ -135,22 +138,7 @@ func (s *CommServer) enterCriticalSection() {
 	defer s.mutex.Unlock()
 }
 
-
-
-func main() {
-	lis, err := net.Listen("tcp", ":5069")
-	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
-	}
-
-	server := grpc.NewServer()
-	newComm := NewCommServer()
-	proto.RegisterRequestServiceServer(server, newComm)
-
-	newComm.LCt = newComm.LCt + 1
-
-	fmt.Printf("L: %d - [Server] (Announcement) Comm server started on port 5069...\n", newComm.LCt)
-
+func (s *CommServer) checkConnections() {
 	// Read Nodes.txt to get addresses and add each line to an array entry
 	nodeArray := []string{}
 	file, err := os.Open("../Nodes.txt")
@@ -172,24 +160,64 @@ func main() {
 
 	// Connect to other nodes
 	for _, address := range nodeArray {
-		if address == "localhost:5069" {
+		if address == s.username {
 			continue // Skip connecting to itself
 		}
+		if _, exists := s.servers[address]; exists {
+			continue // Skip if address is in servers map
+		}
+
 		conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
-			log.Fatalf("Failed to connect: %v", err)
-		}
-		defer conn.Close()
+			fmt.Printf("Node at %s failed to connect", address)
+		} else {
+			client := proto.NewRequestServiceClient(conn)
+			stream, err := client.Comm(context.Background())
+			if err != nil {
+				log.Fatalf("Failed to create stream: %v", err)
+			}
+			fmt.Printf("Connected to node at %s\n", address)
 
-		client := proto.NewRequestServiceClient(conn)
-		stream, err := client.Comm(context.Background())
-		if err != nil {
-			log.Fatalf("Failed to create stream: %v", err)
-		}
-		fmt.Printf("Connected to node at %s\n", address)
+			s.servers[address] = stream
 
-		newComm.servers[address] = stream
+			// Start a goroutine to listen for messages from this node
+			go func(address string, stream grpc.BidiStreamingClient[proto.RequestMessage, proto.RequestMessage]) {
+				for {
+					msg, err := stream.Recv()
+					if err != nil {
+						log.Printf("Error receiving message from %s: %v", address, err)
+						return
+					}
+					switch msg.Message {
+					case "REQUEST":
+						s.handleRequest(msg)
+					case "REPLY":
+						s.handleReply(msg)
+					}
+				}
+			}(address, stream)
+			defer conn.Close()
+		}
 	}
+}
+
+func main() {
+	lis, err := net.Listen("tcp", ":5069")
+	if err != nil {
+		log.Fatalf("Failed to listen: %v", err)
+	}
+
+	server := grpc.NewServer()
+	newComm := NewCommServer()
+	proto.RegisterRequestServiceServer(server, newComm)
+
+	newComm.LCt = newComm.LCt + 1
+
+	fmt.Printf("L: %d - [Server] (Announcement) Comm server started on port 5069...\n", newComm.LCt)
+
+	
+
+	// Listen to other nodes
 
 	go func() {
 		for {
