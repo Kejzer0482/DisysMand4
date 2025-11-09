@@ -34,7 +34,7 @@ type CommServer struct {
 // NewCommServer initializes a new CommServer
 func NewCommServer() *CommServer {
 	return &CommServer{
-		username:   "localhost:5068",
+		username:   "localhost:5067",
 		clients:    make(map[string]proto.RequestService_CommServer),
 		servers:    make(map[string]grpc.BidiStreamingClient[proto.RequestMessage, proto.RequestMessage]),
 		fileName:   "../Database.txt",
