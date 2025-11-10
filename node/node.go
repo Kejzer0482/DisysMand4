@@ -18,10 +18,11 @@ import (
 )
 
 type Peer struct {
-	ID     string
-	Stream proto.RequestService_CommServer
-	Client proto.RequestService_CommClient
-	Active bool
+	ID      string
+	Client  proto.RequestService_CommClient
+	Conn    *grpc.ClientConn
+	Active  bool
+	Connect bool
 }
 
 type CommServer struct {
@@ -34,6 +35,7 @@ type CommServer struct {
 	requestLC   int64
 	deferred    []string
 	waitingReps []string
+	nodeArray   []string
 	LCt         int64
 }
 
@@ -42,12 +44,13 @@ func NewCommServer() *CommServer {
 	return &CommServer{
 		username:    "empty",
 		peers:       make(map[string]*Peer),
-		fileName:    "../Database.txt",
+		fileName:    "Database.txt",
 		mutex:       sync.Mutex{},
 		state:       "RELEASED",
 		requestLC:   0,
 		deferred:    []string{},
 		waitingReps: []string{},
+		nodeArray:   []string{},
 		LCt:         0,
 	}
 }
@@ -56,36 +59,32 @@ func (s *CommServer) Comm(stream proto.RequestService_CommServer) error {
 	// Implementation of the Comm method
 	var username string
 
+	fmt.Println("New client connected")
+
 	// Receive messages from the client
 	for {
 		msg, err := stream.Recv()
+
+		/* if err == nil {
+			fmt.Printf("L: %d - [Comm] Received message from %s: %s\n", s.LCt, msg.Username, msg.Message)
+		} */
 
 		// Handle disconnection
 		if err != nil {
 			s.mutex.Lock()
 			s.peers[username].Active = false
+			s.LCt = s.LCt + 1
 			s.mutex.Unlock()
-			s.incrementLC()
 			fmt.Printf("L: %d - [Comm] Client %s disconnected.\n", s.LCt, username)
 			return err
 		}
 
-		// First message should contain the username
 		if username == "" {
-			s.mutex.Lock()
-			s.peers[msg.Username] = &Peer{
-				ID:     msg.Username,
-				Stream: stream,
-				Active: true,
-			}
-			s.mutex.Unlock()
 			username = msg.Username
 		}
 
-		if !s.peers[username].Active {
-			s.mutex.Lock()
-			s.peers[username].Active = true
-			s.mutex.Unlock()
+		if s.peers[username].Client == nil {
+			s.connectToPeer(msg.Username)
 		}
 
 		// Handle different message types
@@ -104,7 +103,7 @@ func (s *CommServer) Comm(stream proto.RequestService_CommServer) error {
 				Message:   "PING_REPLY",
 				Timestamp: s.LCt,
 			}
-			s.sendTo(msg.Username, pingReply)
+			s.peers[msg.Username].Client.Send(pingReply)
 		case "PING_REPLY":
 			s.mutex.Lock()
 			s.LCt = max(s.LCt, msg.Timestamp) + 1
@@ -113,24 +112,12 @@ func (s *CommServer) Comm(stream proto.RequestService_CommServer) error {
 	}
 }
 
-func (s *CommServer) sendTo(peerID string, msg *proto.RequestMessage) error {
-	s.mutex.Lock()
-	p, ok := s.peers[peerID]
-	s.mutex.Unlock()
-
-	if !ok {
-		return fmt.Errorf("no such peer %s", peerID)
-	}
-
-	if p.Client != nil {
-		return p.Client.Send(msg)
-	}
-	return fmt.Errorf("peer %s has no active stream", peerID)
-}
-
+// Send REPLY message to a specific node
 func (s *CommServer) sendReply(msg *proto.RequestMessage) {
-	s.incrementLC()
+	s.mutex.Lock()
+	s.LCt = s.LCt + 1
 	fmt.Printf("L: %d - [sendReply] Sending REPLY\n", s.LCt)
+	s.mutex.Unlock()
 
 	replyMsg := &proto.RequestMessage{
 		Username:  s.username,
@@ -138,30 +125,38 @@ func (s *CommServer) sendReply(msg *proto.RequestMessage) {
 		Timestamp: s.LCt,
 	}
 
-	s.sendTo(msg.Username, replyMsg)
+	s.mutex.Lock()
+	s.peers[msg.Username].Client.Send(replyMsg)
+	s.mutex.Unlock()
 }
 
+// Handle REQUEST messages
 func (s *CommServer) handleRequest(msg *proto.RequestMessage) {
+	s.mutex.Lock()
+	s.LCt = max(s.LCt, msg.Timestamp) + 1
 	fmt.Printf("L: %d - [handleRequest] Received REQUEST\n", s.LCt)
+	s.mutex.Unlock()
 
 	switch s.state {
 	case "RELEASED":
 		s.sendReply(msg)
 	case "HELD":
 		s.deferred = append(s.deferred, msg.Username)
-		s.incrementLC()
 	case "WANTED":
-		if msg.Timestamp < s.LCt {
+		if msg.Timestamp < s.requestLC || (msg.Timestamp == s.requestLC && msg.Username < s.username) {
 			s.sendReply(msg)
 		} else {
 			s.deferred = append(s.deferred, msg.Username)
-			s.incrementLC()
 		}
 	}
 }
 
+// Handle REPLY messages
 func (s *CommServer) handleReply(msg *proto.RequestMessage) {
+	s.mutex.Lock()
+	s.LCt = max(s.LCt, msg.Timestamp) + 1
 	fmt.Printf("L: %d - [handleReply] Received REPLY\n", s.LCt)
+	s.mutex.Unlock()
 
 	// Remove the sender from waitingRep
 	s.mutex.Lock()
@@ -172,13 +167,13 @@ func (s *CommServer) handleReply(msg *proto.RequestMessage) {
 		}
 	}
 	s.mutex.Unlock()
-
-	s.incrementLC()
 }
 
+// Send REQUEST messages to all nodes
 func (s *CommServer) sendRequests() {
-	s.incrementLC()
+	s.pingPeers()
 	s.mutex.Lock()
+	s.LCt = s.LCt + 1
 	s.state = "WANTED"
 	s.requestLC = s.LCt
 	s.mutex.Unlock()
@@ -191,8 +186,8 @@ func (s *CommServer) sendRequests() {
 	}
 	s.mutex.Lock()
 	for peerID, peer := range s.peers {
-		if peer.Active {
-			err := s.sendTo(peerID, reqMsg)
+		if peer.Active && peer.Client != nil {
+			err := s.peers[peerID].Client.Send(reqMsg)
 			if err != nil {
 				fmt.Printf("Failed to send request to %s: %v", peerID, err)
 				continue
@@ -205,9 +200,8 @@ func (s *CommServer) sendRequests() {
 	s.waitReplies()
 }
 
+// Wait for REPLY messages from all nodes
 func (s *CommServer) waitReplies() {
-	s.incrementLC()
-
 	fmt.Printf("L: %d - [waitReplies] Waiting for REPLY messages from all nodes...\n", s.LCt)
 
 	for {
@@ -221,7 +215,6 @@ func (s *CommServer) waitReplies() {
 
 // Enter the critical section
 func (s *CommServer) enterCriticalSection() {
-	s.incrementLC()
 	s.mutex.Lock()
 	s.state = "HELD"
 	s.mutex.Unlock()
@@ -242,7 +235,6 @@ func (s *CommServer) enterCriticalSection() {
 
 // Exit the critical section
 func (s *CommServer) exitCriticalSection() {
-	s.incrementLC()
 	s.mutex.Lock()
 	s.state = "RELEASED"
 	s.mutex.Unlock()
@@ -264,9 +256,8 @@ func (s *CommServer) exitCriticalSection() {
 	time.Sleep(2 * time.Second) // Short delay before next operation
 }
 
+// Send REPLY messages to deferred requests
 func (s *CommServer) sendReplies() {
-	s.incrementLC()
-
 	fmt.Printf("L: %d - [sendReplies] Sending REPLY messages to deferred requests...\n", s.LCt)
 
 	for _, username := range s.deferred {
@@ -280,57 +271,56 @@ func (s *CommServer) sendReplies() {
 	time.Sleep(2 * time.Second) // Short delay before next operation
 }
 
-// Initial connections to active nodes
-func (s *CommServer) initialConnections() {
-	// Read Nodes.txt to get addresses and add each line to an array entry
-	nodeArray := []string{}
-	file, err := os.Open("../Nodes.txt")
-	if err != nil {
-		fmt.Printf("Failed to open Nodes.txt: %v", err)
+// Connect to a peer
+func (s *CommServer) connectToPeer(node string) {
+	s.mutex.Lock()
+	s.LCt = s.LCt + 1
+	peer, exists := s.peers[node]
+	if !exists {
+		peer = &Peer{ID: node}
+		s.peers[node] = peer
 	}
-	defer file.Close()
-
-	scanner := bufio.NewScanner(file)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		nodeArray = append(nodeArray, line)
-	}
-
-	// Connect to other nodes
-	for _, address := range nodeArray {
-		if address == s.username {
-			continue // Skip connecting to itself
-		}
-
-		conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			fmt.Printf("Failed to connect to %s: %v", address, err)
-			continue
-		}
-
-		client := proto.NewRequestServiceClient(conn)
-		stream, err := client.Comm(context.Background())
-		if err != nil {
-			fmt.Printf("Node at %s not active.\n", address)
-		}
-
-		s.mutex.Lock()
-		peer, exists := s.peers[address]
-		if !exists {
-			peer = &Peer{ID: address}
-			s.peers[address] = peer
-		}
-		peer.Client = stream
-		peer.Active = true
+	if peer.Client != nil || peer.Connect {
 		s.mutex.Unlock()
-
+		return // already connected or connecting
 	}
+	peer.Connect = true
+	s.mutex.Unlock()
+
+	fmt.Printf("L: %d - [connectToPeer] Connecting to peer %s\n", s.LCt, node)
+
+	conn, err := grpc.NewClient(node, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		fmt.Printf("Failed to dial %s\n", node)
+		s.mutex.Lock()
+		peer.Connect = false
+		s.mutex.Unlock()
+		return
+	}
+
+	client := proto.NewRequestServiceClient(conn)
+	stream, err := client.Comm(context.Background())
+	if err != nil {
+		fmt.Printf("Node at %s not active\n", node)
+		conn.Close()
+		s.mutex.Lock()
+		peer.Connect = false
+		s.mutex.Unlock()
+		return
+	}
+
+	s.mutex.Lock()
+	peer.Client = stream
+	peer.Conn = conn
+	peer.Active = true
+	peer.Connect = false
+	s.mutex.Unlock()
 }
 
-// Check and maintain connections to other nodes
+// Ping peers and connect if needed
 func (s *CommServer) pingPeers() {
 	s.mutex.Lock()
+	s.LCt = s.LCt + 1
 	peers := make([]*Peer, 0, len(s.peers))
 	for _, p := range s.peers {
 		peers = append(peers, p)
@@ -338,24 +328,30 @@ func (s *CommServer) pingPeers() {
 	s.mutex.Unlock()
 
 	for _, p := range peers {
-		msg := &proto.RequestMessage{
-			Username:  s.username,
-			Message:   "PING",
-			Timestamp: s.LCt,
+		if p == nil {
+			continue
 		}
-		if err := s.sendTo(p.ID, msg); err != nil {
-			//fmt.Printf("Peer %s unreachable: %v\n", p.ID, err)
-			s.mutex.Lock()
-			p.Active = false
-			s.mutex.Unlock()
+
+		if p.Client != nil {
+			if err := p.Client.Send(&proto.RequestMessage{
+				Username: s.username, Message: "PING", Timestamp: s.LCt,
+			}); err != nil {
+				s.mutex.Lock()
+				p.Active = false
+				p.Client = nil
+				s.mutex.Unlock()
+			}
+			continue
+		}
+
+		// only try to connect if not already connecting
+		s.mutex.Lock()
+		connecting := p.Connect
+		s.mutex.Unlock()
+		if !connecting {
+			go s.connectToPeer(p.ID)
 		}
 	}
-}
-
-func (s *CommServer) incrementLC() {
-	s.mutex.Lock()
-	s.LCt = s.LCt + 1
-	s.mutex.Unlock()
 }
 
 func main() {
@@ -376,17 +372,27 @@ func main() {
 
 	newComm.LCt = newComm.LCt + 1
 
-	fmt.Printf("L: %d - [Server] Comm server started on port %s...\n", newComm.LCt, *port)
+	fmt.Printf("L: %d - [Server] Comm server started on port %s\n", newComm.LCt, *port)
 
-	newComm.initialConnections()
+	file, err := os.Open("Nodes.txt")
+	if err != nil {
+		fmt.Printf("Failed to open Nodes.txt: %v", err)
+	}
+	defer file.Close()
 
-	// Periodically send REQUEST messages
-	go func() {
-		for {
-			newComm.pingPeers()
-			time.Sleep(10 * time.Second) // Wait before next ping
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		newComm.nodeArray = append(newComm.nodeArray, line)
+	}
+
+	// Set up peers
+	for _, node := range newComm.nodeArray {
+		if node != addr {
+			newComm.peers[node] = &Peer{ID: node, Active: false}
 		}
-	}()
+	}
 
 	go func() {
 		for {
